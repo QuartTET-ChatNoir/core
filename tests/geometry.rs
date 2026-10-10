@@ -52,7 +52,7 @@ fn rotation_preserves_radius() {
 fn te4_round_trip() {
     for kind in 0..3 {
         let m = Mesh4::sample(kind);
-        let parsed = Mesh4::from_te4(&m.to_te4(), false).unwrap();
+        let parsed = Mesh4::from_te4(&m.to_te4(), true).unwrap();
         assert_eq!(parsed.cells, m.cells);
         assert_eq!(parsed.vertices.len(), m.vertices.len());
     }
@@ -73,16 +73,19 @@ fn rejects_corruption() {
     assert!(Mesh4::from_te4(&b, false).is_err());
 }
 #[test]
-fn one_based_is_explicit() {
+fn te4_is_one_based_and_zero_based_is_compatibility_only() {
     let m = Mesh4::sample(1);
     let mut b = m.to_te4();
-    for i in (12 + 16 * m.vertices.len()..b.len()).step_by(4) {
-        let value = u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
-        b[i..i + 4].copy_from_slice(&(value + 1).to_le_bytes());
-    }
     assert_eq!(Mesh4::from_te4(&b, true).unwrap().cells, m.cells);
     assert!(Mesh4::from_te4(&b, false).is_err());
+    for i in (12 + 16 * m.vertices.len()..b.len()).step_by(4) {
+        let value = u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+        b[i..i + 4].copy_from_slice(&(value - 1).to_le_bytes());
+    }
+    assert_eq!(Mesh4::from_te4(&b, false).unwrap().cells, m.cells);
+    assert!(Mesh4::from_te4(&b, true).is_err());
 }
+
 #[test]
 fn coplanar_cells_are_reported() {
     let s = Mesh4::sample(0).section(3, 1., [0.; 6]).unwrap();
@@ -104,9 +107,9 @@ fn accepts_more_than_two_million_vertices_and_64_mib() {
     bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
     let start = 12 + n as usize * 16;
     for j in 0..4usize {
-        bytes[start + j * 4..start + j * 4 + 4].copy_from_slice(&(j as u32).to_le_bytes());
+        bytes[start + j * 4..start + j * 4 + 4].copy_from_slice(&(j as u32 + 1).to_le_bytes());
     }
-    let mesh = Mesh4::from_te4(&bytes, false).unwrap();
+    let mesh = Mesh4::from_te4(&bytes, true).unwrap();
     assert_eq!(mesh.vertices.len(), n as usize);
     assert_eq!(mesh.cells, vec![[0, 1, 2, 3]]);
 }
@@ -131,7 +134,7 @@ fn reads_all_te4_normal_variants() {
                 bytes.extend(value.to_le_bytes());
             }
         }
-        let parsed = Mesh4::from_te4(&bytes, false).unwrap();
+        let parsed = Mesh4::from_te4(&bytes, true).unwrap();
         assert_eq!(parsed.vertices, mesh.vertices);
         assert_eq!(parsed.vertex_normals.len(), mesh.vertices.len());
         assert_eq!(parsed.cell_normals.len(), mesh.cells.len());
@@ -150,7 +153,7 @@ fn reads_all_te4_normal_variants() {
         if normal_count > 0 {
             let end = bytes.len();
             bytes[end - 4..].copy_from_slice(&f32::NAN.to_le_bytes());
-            assert!(Mesh4::from_te4(&bytes, false).is_err());
+            assert!(Mesh4::from_te4(&bytes, true).is_err());
         }
     }
 }

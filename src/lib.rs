@@ -189,7 +189,7 @@ impl Mesh4 {
         }
         for c in &self.cells {
             for v in c {
-                b.extend(v.to_le_bytes());
+                b.extend((v + 1).to_le_bytes());
             }
         }
         b
@@ -306,6 +306,29 @@ impl Mesh4 {
                     .atan2(dot(a, u))
                     .total_cmp(&dot(b, v).atan2(dot(b, u)))
             });
+            if polygon.len() == 4 {
+                let angle = |at: usize| {
+                    let a = sub(polygon[(at + 3) % 4].1, polygon[at].1);
+                    let b = sub(polygon[(at + 1) % 4].1, polygon[at].1);
+                    norm(cross(a, b)).atan2(dot(a, b))
+                };
+                let sum = angle(1) + angle(3);
+                let diagonal = |a: usize, b: usize| {
+                    let mut key = [polygon[a].0, polygon[b].0];
+                    key.sort();
+                    key
+                };
+                // Same angular tolerance as f32 GPU, and an index-based rule
+                // for cocircular quads independent of polygon starting corner.
+                let flip = if (sum - std::f64::consts::PI).abs() <= 1e-6 {
+                    diagonal(1, 3) < diagonal(0, 2)
+                } else {
+                    sum > std::f64::consts::PI
+                };
+                if flip {
+                    polygon.rotate_left(1);
+                }
+            }
             for j in 1..polygon.len() - 1 {
                 let tri = [polygon[0], polygon[j], polygon[j + 1]];
                 if norm(cross(sub(tri[1].1, tri[0].1), sub(tri[2].1, tri[0].1))) <= eps * eps {

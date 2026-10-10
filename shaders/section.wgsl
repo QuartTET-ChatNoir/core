@@ -13,6 +13,24 @@ struct Vertex { position: vec4<f32>, normal: vec4<f32> }
 @group(0) @binding(4) var<uniform> params: Params;
 @group(0) @binding(5) var<storage, read> vertex_normals: array<vec4<f32>>;
 @group(0) @binding(6) var<storage, read> cell_normals: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read> original_ids: array<u32>;
+fn key_less(a: vec2<u32>, b: vec2<u32>) -> bool {
+  return a.x < b.x || (a.x == b.x && a.y < b.y);
+}
+fn diagonal_key(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
+  if key_less(b,a) { return vec4<u32>(b,a); }
+  return vec4<u32>(a,b);
+}
+fn diagonal_less(a: vec4<u32>, b: vec4<u32>) -> bool {
+  for (var i=0u; i<4u; i++) {
+    if a[i] != b[i] { return a[i] < b[i]; }
+  }
+  return false;
+}
+fn interior_angle(a: vec3<f32>, center: vec3<f32>, b: vec3<f32>) -> f32 {
+  let u=a-center; let v=b-center;
+  return atan2(length(cross(u,v)),dot(u,v));
+}
 fn safe_normal(value: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
   if dot(value,value) > 1e-20 { return normalize(value); }
   return fallback;
@@ -52,6 +70,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
   var polygon: array<vec3<f32>,4>;
   var shading: array<vec3<f32>,4>;
+  var keys: array<vec2<u32>,4>;
   var projected_normals: array<vec3<f32>,4>;
   if (params.counts.y & 1u) != 0u {
     for (var i=0u; i<4u; i++) {
@@ -60,14 +79,17 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
   var n = 0u;
   for (var i=0u; i<4u; i++) {
-    if abs(d[i]) <= eps { polygon[n] = project(p[i],axis); shading[n] = projected_normals[i]; n++; }
+    if abs(d[i]) <= eps { polygon[n] = project(p[i],axis); shading[n] = projected_normals[i];
+      keys[n] = vec2<u32>(original_ids[cell[i]]); n++; }
   }
   for (var a=0u; a<4u; a++) {
     for (var b=a+1u; b<4u; b++) {
       if (d[a]>eps && d[b]< -eps) || (d[b]>eps && d[a]< -eps) {
         let t = d[a] / (d[a]-d[b]);
         polygon[n] = project(mix(p[a],p[b],t),axis);
-        shading[n] = mix(projected_normals[a],projected_normals[b],t); n++;
+        shading[n] = mix(projected_normals[a],projected_normals[b],t);
+        let ia=original_ids[cell[a]]; let ib=original_ids[cell[b]];
+        keys[n]=vec2<u32>(min(ia,ib),max(ia,ib)); n++;
       }
     }
   }
@@ -98,7 +120,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let angle=angles[i]; angles[i]=angles[j]; angles[j]=angle;
         let point=polygon[i]; polygon[i]=polygon[j]; polygon[j]=point;
         let shade=shading[i]; shading[i]=shading[j]; shading[j]=shade;
+        let key=keys[i]; keys[i]=keys[j]; keys[j]=key;
       }
+    }
+  }
+  if n == 4u {
+    let sum=interior_angle(polygon[0],polygon[1],polygon[2])
+      + interior_angle(polygon[2],polygon[3],polygon[0]);
+    var flip=sum > 3.141592653589793;
+    if abs(sum-3.141592653589793) <= 1e-6 {
+      flip=diagonal_less(diagonal_key(keys[1],keys[3]),diagonal_key(keys[0],keys[2]));
+    }
+    if flip {
+      let first=polygon[0]; let first_shade=shading[0];
+      for (var i=0u; i<3u; i++) { polygon[i]=polygon[i+1u]; shading[i]=shading[i+1u]; }
+      polygon[3]=first; shading[3]=first_shade;
     }
   }
   // Maximum 2 triangles per tetrahedron. Compact on the GPU, then indirect draw.
