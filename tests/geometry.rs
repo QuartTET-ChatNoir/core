@@ -69,7 +69,7 @@ fn rejects_corruption() {
     b[start..start + 4].copy_from_slice(&100u32.to_le_bytes());
     assert!(Mesh4::from_te4(&b, false).is_err());
     let mut b = m.to_te4();
-    b[0..4].copy_from_slice(&2u32.to_le_bytes());
+    b[0..4].copy_from_slice(&5u32.to_le_bytes());
     assert!(Mesh4::from_te4(&b, false).is_err());
 }
 #[test]
@@ -93,4 +93,90 @@ fn invalid_parameters_fail() {
     let m = Mesh4::sample(0);
     assert!(m.section(4, 0., [0.; 6]).is_err());
     assert!(m.section(3, f64::NAN, [0.; 6]).is_err());
+}
+
+#[test]
+fn accepts_more_than_two_million_vertices_and_64_mib() {
+    let n = 4_194_305u32;
+    let mut bytes = vec![0u8; 12 + n as usize * 16 + 16];
+    bytes[..4].copy_from_slice(&1u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&n.to_le_bytes());
+    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+    let start = 12 + n as usize * 16;
+    for j in 0..4usize {
+        bytes[start + j * 4..start + j * 4 + 4].copy_from_slice(&(j as u32).to_le_bytes());
+    }
+    let mesh = Mesh4::from_te4(&bytes, false).unwrap();
+    assert_eq!(mesh.vertices.len(), n as usize);
+    assert_eq!(mesh.cells, vec![[0, 1, 2, 3]]);
+}
+
+#[test]
+fn reads_all_te4_normal_variants() {
+    let mesh = Mesh4::sample(1);
+    for kind in 1..=4u32 {
+        let mut bytes = mesh.to_te4();
+        bytes[..4].copy_from_slice(&kind.to_le_bytes());
+        let normal_count = if matches!(kind, 2 | 4) {
+            mesh.vertices.len()
+        } else {
+            0
+        } + if matches!(kind, 3 | 4) {
+            mesh.cells.len()
+        } else {
+            0
+        };
+        for _ in 0..normal_count {
+            for value in [1.0f32, 0.0, 0.0, 0.0] {
+                bytes.extend(value.to_le_bytes());
+            }
+        }
+        let parsed = Mesh4::from_te4(&bytes, false).unwrap();
+        assert_eq!(parsed.vertices, mesh.vertices);
+        assert_eq!(parsed.vertex_normals.len(), mesh.vertices.len());
+        assert_eq!(parsed.cell_normals.len(), mesh.cells.len());
+        if matches!(kind, 2 | 4) {
+            assert!(parsed.vertex_normals.iter().all(|n| *n == [1., 0., 0., 0.]));
+        }
+        if matches!(kind, 3 | 4) {
+            assert!(parsed.cell_normals.iter().all(|n| *n == [1., 0., 0., 0.]));
+        }
+        assert_eq!(parsed.cells, mesh.cells);
+        assert_eq!(
+            parsed.section(3, 0.0, [0.; 6]).unwrap().triangles.len(),
+            mesh.section(3, 0.0, [0.; 6]).unwrap().triangles.len()
+        );
+        assert!(Mesh4::from_te4(&bytes[..bytes.len() - 1], false).is_err());
+        if normal_count > 0 {
+            let end = bytes.len();
+            bytes[end - 4..].copy_from_slice(&f32::NAN.to_le_bytes());
+            assert!(Mesh4::from_te4(&bytes, false).is_err());
+        }
+    }
+}
+
+#[test]
+fn generates_volume_weighted_4d_vertex_normals() {
+    let mut mesh = Mesh4 {
+        vertices: vec![
+            [0., 0., 0., 0.],
+            [0., 1., 0., 0.],
+            [0., 0., 1., 0.],
+            [0., 0., 0., 1.],
+            [1., 0., 0., 0.],
+            [0., 0., 0., 2.],
+        ],
+        cells: vec![[0, 1, 2, 3], [0, 4, 2, 5]],
+        vertex_normals: Vec::new(),
+        cell_normals: Vec::new(),
+    };
+    mesh.generate_missing_normals().unwrap();
+    assert_eq!(mesh.cell_normals, vec![[1., 0., 0., 0.], [0., -1., 0., 0.]]);
+    let expected = [1. / 5f32.sqrt(), -2. / 5f32.sqrt(), 0., 0.];
+    for (actual, expected) in mesh.vertex_normals[0].iter().zip(expected) {
+        assert!((actual - expected).abs() < 1e-6);
+    }
+    let original = mesh.vertex_normals.clone();
+    mesh.generate_missing_normals().unwrap();
+    assert_eq!(mesh.vertex_normals, original);
 }

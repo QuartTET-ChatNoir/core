@@ -17,13 +17,17 @@ viewer: <https://github.com/QuartTET-ChatNoir/viewer>
 
 |順序|内容|型|
 |---|---|---|
-|1|file type = 1|u32|
+|1|file type = 1–4|u32|
 |2|頂点数 n|u32|
 |3|四面体胞数 m|u32|
 |4|n 個の頂点 `(x,y,z,w)`|f32 × 4|
 |5|m 個の胞 `(a,b,c,d)`|u32 × 4|
 
-長さは厳密に `12 + 16n + 16m` bytes。通常は頂点番号が0始まり。1始まりは引数で明示できます。保存は0始まりです。type 2–4、法線、テクスチャ、周期性の拡張は未対応です。
+座標・頂点番号の後に、type 2は頂点法線 `f32 × 4 × n`、type 3は胞法線 `f32 × 4 × m`、type 4は頂点法線・胞法線の順で両方が続きます（GeneralMeeting2、10ページ）。type 1は法線なしです。
+
+長さは厳密に `12 + 16n + 16m + 法線配列のbytes`。付属法線の有限値を検査し、正規化して保持します。不足する胞法線は4Dの3本の辺から生成。不足する頂点法線は隣接胞法線を四面体の3次元体積で重み付けして平均・正規化し、読込時に一度だけ保持します。付属法線を優先し、type 2で生成する胞法線の向きは付属頂点法線に合わせます。
+
+生成時は胞の頂点順序が整合していることを前提とします。退化胞や相殺する法線はゼロになり、描画時に幾何法線へフォールバックします。通常は頂点番号が0始まり。1始まりは引数で明示できます。保存APIはtype 1・0始まりです。固定の200万頂点・胞制限はありません。実メモリ容量には依存します。テクスチャ、周期性は未対応です。
 
 切断軸 X/Y/Z/W を除いた3座標をそのまま3次元座標とします。回転順は XY → XZ → XW → YZ → YW → ZW。回転と切断は元モデルの AABB 中心を原点として行い、表示時だけ外接半径で規格化します。
 
@@ -37,9 +41,13 @@ WGSL を独立したファイルとして読み込んでください。`ViewerMo
 |---|---|---|
 |0|入力頂点|`vec4<f32>[]`|
 |1|入力胞|32 bytes / 胞: 頂点番号4個 + 共有面所有ビットマスク + padding 3個|
-|2|出力頂点|32 bytes / 頂点: position vec4 + flat normal vec4。最大6頂点 / 胞|
+|2|出力頂点|32 bytes / 頂点: position vec4 + normal vec4。最大6頂点 / 胞|
 |3|カウンタ|u32 5個: vertexCount, instanceCount=1, firstVertex=0, firstInstance=0, coplanarCount|
-|4|uniform|112 bytes: rotation mat4, center vec4, (offset, axis, epsilon, radius), (cellCount, 0, 0, 0)|
+|4|uniform|112 bytes: rotation mat4, center vec4, (offset, axis, epsilon, radius), (cellCount, normalFlags, 0, 0)|
+|5|頂点4D法線|`vec4<f32>[]`、入力頂点と同じ番号|
+|6|胞4D法線|`vec4<f32>[]`、入力胞と同じ番号|
+
+`normalFlags` は bit 0 = 頂点法線を使う、bit 1 = 胞法線を使う。法線がないbindingにも16 bytes以上のダミーバッファを渡します。4D法線を回転して切断軸成分を除き、3D法線として正規化します。頂点法線は辺の交点で補間してから射影・正規化。射影がゼロに近い場合は幾何法線に戻します。
 
 dispatch は `ceil(cellCount / 64)`。毎回 binding 3 を `[0,1,0,0,0]` に初期化してから計算し、先頭16 bytesを `drawIndirect` に渡します。出力三角形の順序は不定です。
 

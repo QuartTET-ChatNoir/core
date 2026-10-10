@@ -7,6 +7,8 @@ pub type Point4 = [f64; 4];
 pub struct Mesh4 {
     pub vertices: Vec<Point4>,
     pub cells: Vec<[u32; 4]>,
+    pub vertex_normals: Vec<[f32; 4]>,
+    pub cell_normals: Vec<[f32; 4]>,
 }
 #[derive(Debug, Default)]
 pub struct Section {
@@ -15,20 +17,25 @@ pub struct Section {
 }
 
 impl Mesh4 {
-    /// Minimum TE4 dialect: LE u32 type=1, vertex/cell counts, f32 XYZW, u32 indices.
+    /// TE4 types 1–4: header, positions, cells, optional vertex then cell normals.
     /// Index base is explicit because historical exporters may use one-based indices.
     pub fn from_te4(bytes: &[u8], one_based: bool) -> Result<Self, String> {
         if bytes.len() < 12 {
             return Err("TE4 header is truncated".into());
         }
         let word = |i| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
-        if word(0) != 1 {
-            return Err("Only TE4 type 1 (without normals) is supported".into());
+        let kind = word(0);
+        if !(1..=4).contains(&kind) {
+            return Err(format!("Unknown TE4 type {kind}; expected 1–4"));
         }
         let n = word(4) as usize;
         let m = word(8) as usize;
+        let vertex_normals = matches!(kind, 2 | 4);
+        let cell_normals = matches!(kind, 3 | 4);
         let expected = n
             .checked_add(m)
+            .and_then(|x| x.checked_add(if vertex_normals { n } else { 0 }))
+            .and_then(|x| x.checked_add(if cell_normals { m } else { 0 }))
             .and_then(|x| x.checked_mul(16))
             .and_then(|x| x.checked_add(12))
             .ok_or("TE4 size overflow")?;
@@ -41,10 +48,10 @@ impl Mesh4 {
         if n == 0 || m == 0 {
             return Err("TE4 must contain vertices and cells".into());
         }
-        if n > 2_000_000 || m > 2_000_000 {
-            return Err("TE4 exceeds the 2 million vertex/cell limit".into());
-        }
-        let mut vertices = Vec::with_capacity(n);
+        let mut vertices = Vec::new();
+        vertices
+            .try_reserve_exact(n)
+            .map_err(|_| "Insufficient memory for TE4 vertices")?;
         for i in 0..n {
             let p = std::array::from_fn(|j| f32::from_bits(word(12 + i * 16 + j * 4)) as f64);
             if !p.iter().all(|x| x.is_finite()) {
@@ -52,7 +59,10 @@ impl Mesh4 {
             }
             vertices.push(p);
         }
-        let mut cells = Vec::with_capacity(m);
+        let mut cells = Vec::new();
+        cells
+            .try_reserve_exact(m)
+            .map_err(|_| "Insufficient memory for TE4 cells")?;
         for i in 0..m {
             let mut cell = [0; 4];
             for (j, index) in cell.iter_mut().enumerate() {
@@ -72,8 +82,101 @@ impl Mesh4 {
             }
             cells.push(cell);
         }
-        Ok(Self { vertices, cells })
+        let mut at = 12 + (n + m) * 16;
+        let mut read_normals = |count: usize| -> Result<Vec<[f32; 4]>, String> {
+            let mut normals = Vec::new();
+            normals
+                .try_reserve_exact(count)
+                .map_err(|_| "Insufficient memory for TE4 normals")?;
+            for _ in 0..count {
+                let values: [f64; 4] =
+                    std::array::from_fn(|j| f32::from_bits(word(at + j * 4)) as f64);
+                at += 16;
+                if !values.iter().all(|v| v.is_finite()) {
+                    return Err("TE4 contains a non-finite normal".into());
+                }
+                let length = values.iter().map(|v| v * v).sum::<f64>().sqrt();
+                // Normalize in f64 to handle even very large or tiny f32 normals.
+                normals.push(values.map(|v| {
+                    if length > 0.0 {
+                        (v / length) as f32
+                    } else {
+                        0.0
+                    }
+                }));
+            }
+            Ok(normals)
+        };
+        let vertex_normals = read_normals(if vertex_normals { n } else { 0 })?;
+        let cell_normals = read_normals(if cell_normals { m } else { 0 })?;
+        let mut mesh = Self {
+            vertices,
+            cells,
+            vertex_normals,
+            cell_normals,
+        };
+        mesh.generate_missing_normals()?;
+        Ok(mesh)
     }
+
+    /// Cache missing 4D normals once. Authored normals take precedence.
+    /// Cell index order supplies orientation; adjacent cells should be consistently wound.
+    pub fn generate_missing_normals(&mut self) -> Result<(), String> {
+        let missing_cells = self.cell_normals.is_empty();
+        let missing_vertices = self.vertex_normals.is_empty();
+        if !missing_cells && !missing_vertices {
+            return Ok(());
+        }
+        if missing_cells {
+            self.cell_normals
+                .try_reserve_exact(self.cells.len())
+                .map_err(|_| "Insufficient memory for generated cell normals")?;
+        }
+        let mut sums: Vec<[f64; 4]> = Vec::new();
+        if missing_vertices {
+            sums.try_reserve_exact(self.vertices.len())
+                .map_err(|_| "Insufficient memory for vertex normal accumulation")?;
+            sums.resize(self.vertices.len(), [0.; 4]);
+        }
+        for (id, cell) in self.cells.iter().enumerate() {
+            let mut geometric = tetra_normal(cell.map(|v| self.vertices[v as usize]));
+            if missing_cells && !missing_vertices {
+                let direction: Point4 = std::array::from_fn(|j| {
+                    cell.iter()
+                        .map(|v| self.vertex_normals[*v as usize][j] as f64)
+                        .sum()
+                });
+                if (0..4).map(|j| geometric[j] * direction[j]).sum::<f64>() < 0. {
+                    geometric = geometric.map(|v| -v);
+                }
+            }
+            // Magnitude is six times the tetrahedron's intrinsic 3D volume.
+            let weight = geometric.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if missing_cells {
+                self.cell_normals
+                    .push(geometric.map(|v| if weight > 0. { (v / weight) as f32 } else { 0. }));
+            }
+            if missing_vertices {
+                for vertex in cell {
+                    for (axis, value) in self.cell_normals[id].iter().enumerate() {
+                        sums[*vertex as usize][axis] += *value as f64 * weight;
+                    }
+                }
+            }
+        }
+        if missing_vertices {
+            self.vertex_normals
+                .try_reserve_exact(self.vertices.len())
+                .map_err(|_| "Insufficient memory for generated vertex normals")?;
+            for sum in sums {
+                let length = sum.iter().map(|v| v * v).sum::<f64>().sqrt();
+                self.vertex_normals
+                    .push(sum.map(|v| if length > 0. { (v / length) as f32 } else { 0. }));
+            }
+        }
+        Ok(())
+    }
+
     pub fn to_te4(&self) -> Vec<u8> {
         let mut b = Vec::new();
         for v in [1, self.vertices.len() as u32, self.cells.len() as u32] {
@@ -245,6 +348,26 @@ impl Mesh4 {
         packed
     }
 
+    fn convex_sample(vertices: Vec<Point4>, mut cells: Vec<[u32; 4]>) -> Self {
+        for cell in &mut cells {
+            let points = cell.map(|v| vertices[v as usize]);
+            let normal = tetra_normal(points);
+            let center: Point4 =
+                std::array::from_fn(|j| points.iter().map(|p| p[j]).sum::<f64>() / 4.);
+            if (0..4).map(|j| normal[j] * center[j]).sum::<f64>() < 0. {
+                cell.swap(0, 1);
+            }
+        }
+        let mut mesh = Self {
+            vertices,
+            cells,
+            vertex_normals: Vec::new(),
+            cell_normals: Vec::new(),
+        };
+        mesh.generate_missing_normals()
+            .expect("Small built-in sample normals");
+        mesh
+    }
     pub fn sample(kind: u32) -> Self {
         if kind == 1 {
             // Regular 16-cell boundary.
@@ -256,7 +379,7 @@ impl Mesh4 {
             let cells = (0..16)
                 .map(|mask| std::array::from_fn(|a| 2 * a as u32 + ((mask >> a) & 1)))
                 .collect();
-            return Self { vertices, cells };
+            return Self::convex_sample(vertices, cells);
         }
         if kind == 2 {
             let vertices = vec![
@@ -272,7 +395,7 @@ impl Mesh4 {
                     [c[0], c[1], c[2], c[3]]
                 })
                 .collect();
-            return Self { vertices, cells };
+            return Self::convex_sample(vertices, cells);
         }
         let vertices = (0..16)
             .map(|mask| std::array::from_fn(|j| if mask & (1 << j) == 0 { -1. } else { 1. }))
@@ -299,8 +422,29 @@ impl Mesh4 {
                 }
             }
         }
-        Self { vertices, cells }
+        Self::convex_sample(vertices, cells)
     }
+}
+fn tetra_normal(points: [Point4; 4]) -> Point4 {
+    let edges: [Point4; 3] =
+        std::array::from_fn(|i| std::array::from_fn(|j| points[i + 1][j] - points[0][j]));
+    std::array::from_fn(|omitted| {
+        let mut axes = [0; 3];
+        let mut at = 0;
+        for j in 0..4 {
+            if j != omitted {
+                axes[at] = j;
+                at += 1;
+            }
+        }
+        let a = edges[0];
+        let b = edges[1];
+        let c = edges[2];
+        let [x, y, z] = [axes[0], axes[1], axes[2]];
+        let det = a[x] * (b[y] * c[z] - b[z] * c[y]) - a[y] * (b[x] * c[z] - b[z] * c[x])
+            + a[z] * (b[x] * c[y] - b[y] * c[x]);
+        if omitted % 2 == 0 { det } else { -det }
+    })
 }
 fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     std::array::from_fn(|j| a[j] - b[j])
@@ -364,6 +508,12 @@ impl ViewerModel {
     }
     pub fn gpu_cells(&self) -> Vec<u32> {
         self.mesh.gpu_cells()
+    }
+    pub fn vertex_normals(&self) -> Vec<f32> {
+        self.mesh.vertex_normals.iter().flatten().copied().collect()
+    }
+    pub fn cell_normals(&self) -> Vec<f32> {
+        self.mesh.cell_normals.iter().flatten().copied().collect()
     }
     pub fn center(&self) -> Vec<f64> {
         self.mesh.center_radius().0.to_vec()
