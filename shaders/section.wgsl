@@ -14,6 +14,7 @@ struct Vertex { position: vec4<f32>, normal: vec4<f32> }
 @group(0) @binding(5) var<storage, read> vertex_normals: array<vec4<f32>>;
 @group(0) @binding(6) var<storage, read> cell_normals: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read> original_ids: array<u32>;
+@group(0) @binding(8) var<storage, read> candidates: array<u32>;
 fn key_less(a: vec2<u32>, b: vec2<u32>) -> bool {
   return a.x < b.x || (a.x == b.x && a.y < b.y);
 }
@@ -43,10 +44,40 @@ fn project(p: vec4<f32>, axis: u32) -> vec3<f32> {
     default: { return p.xyz; }
   }
 }
+// Project the unique triangular faces of the tetrahedral mesh, up to 12 vertices/cell.
+fn project_cell(cell_id: u32, axis: u32) {
+  let cell=cells[cell_id];
+  var points: array<vec3<f32>,4>;
+  for(var i=0u;i<4u;i++) {
+    let p=params.rotation*(positions[cell.indices[i]]-params.center);
+    var q=project(p,axis)/params.plane.w;
+    if params.counts.z == 2u { q*=params.plane.x/(params.plane.x-p[axis]); }
+    points[i]=q;
+  }
+  for(var omitted=0u;omitted<4u;omitted++) {
+    if (cell.ownership.x & (1u<<omitted)) == 0u { continue; }
+    var face: array<u32,3>; var at=0u;
+    for(var i=0u;i<4u;i++) { if i!=omitted { face[at]=i; at++; } }
+    let a=points[face[0]];let b=points[face[1]];let c=points[face[2]];
+    let cross_product=cross(b-a,c-a);
+    if length(cross_product)<=1e-12 { continue; }
+    let normal=vec4<f32>(normalize(cross_product),0.0);
+    let start=atomicAdd(&counters[0],3u);
+    output[start]=Vertex(vec4<f32>(a,1.0),normal);
+    output[start+1u]=Vertex(vec4<f32>(b,1.0),normal);
+    output[start+2u]=Vertex(vec4<f32>(c,1.0),normal);
+  }
+}
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  if id.x >= params.counts.x { return; }
-  let cell = cells[id.x].indices;
+  var cell_id=id.x;
+  let use_bvh=(params.counts.y & 4u)!=0u && params.counts.z==0u;
+  if use_bvh {
+    if id.x >= atomicLoad(&counters[5]) { return; }
+    cell_id=candidates[id.x];
+  } else if id.x >= params.counts.x { return; }
+  if params.counts.z != 0u { project_cell(cell_id,u32(params.plane.y)); return; }
+  let cell = cells[cell_id].indices;
   let axis = u32(params.plane.y);
   let eps = params.plane.z;
   var p: array<vec4<f32>,4>;
@@ -65,7 +96,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if positive == 4u || negative == 4u { return; }
   if on == 3u {
     for (var i=0u; i<4u; i++) {
-      if abs(d[i]) > eps && (cells[id.x].ownership.x & (1u << i)) == 0u { return; }
+      if abs(d[i]) > eps && (cells[cell_id].ownership.x & (1u << i)) == 0u { return; }
     }
   }
   var polygon: array<vec3<f32>,4>;
@@ -106,7 +137,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if length(normal) <= eps*eps { return; }
   normal = normalize(normal);
   if (params.counts.y & 2u) != 0u {
-    normal = safe_normal(project(params.rotation * cell_normals[id.x],axis),normal);
+    normal = safe_normal(project(params.rotation * cell_normals[cell_id],axis),normal);
   }
   let v = cross(normal,u);
   var angles: array<f32,4>;
